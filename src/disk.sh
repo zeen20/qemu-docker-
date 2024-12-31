@@ -4,7 +4,7 @@ set -Eeuo pipefail
 # Docker environment variables
 
 : "${DISK_IO:="native"}"          # I/O Mode, can be set to 'native', 'threads' or 'io_turing'
-: "${DISK_FMT:=""}"               # Disk file format, can be set to "raw" (default) or "qcow2"
+DISK_FMT="${DISK_FMT:="vhd"}"     # Disk file format, can be set to "raw" (default) or "qcow2" or "vhd"
 : "${DISK_TYPE:=""}"              # Device type to be used, choose "ide", "usb", "blk" or "scsi"
 : "${DISK_FLAGS:=""}"             # Specifies the options for use with the qcow2 disk format
 : "${DISK_CACHE:="none"}"         # Caching mode, can be set to 'writeback' for better performance
@@ -21,6 +21,9 @@ fmt2ext() {
     raw)
       echo "img"
       ;;
+    vhd)
+      echo "vhd"
+      ;;
     *)
       error "Unrecognized disk format: $DISK_FMT" && exit 78
       ;;
@@ -36,6 +39,9 @@ ext2fmt() {
       ;;
     img)
       echo "raw"
+      ;;
+    vhd)
+      echo "vhd"
       ;;
     *)
       error "Unrecognized file extension: .$DISK_EXT" && exit 78
@@ -57,30 +63,14 @@ getSize() {
     qcow2)
       qemu-img info "$DISK_FILE" -f "$DISK_FMT" | grep '^virtual size: ' | sed 's/.*(\(.*\) bytes)/\1/'
       ;;
+    vhd)
+      # Add specific handling for VHD format
+      vhd-tool info "$DISK_FILE" | grep 'Virtual size' | awk '{print $3}'
+      ;;
     *)
       error "Unrecognized disk format: $DISK_FMT" && exit 78
       ;;
   esac
-}
-
-isCow() {
-  local FS=$1
-
-  if [[ "${FS,,}" == "btrfs" ]]; then
-    return 0
-  fi
-
-  return 1
-}
-
-supportsDirect() {
-  local FS=$1
-
-  if [[ "${FS,,}" == "ecryptfs" ]] || [[ "${FS,,}" == "tmpfs" ]]; then
-    return 1
-  fi
-
-  return 0
 }
 
 createDisk() {
@@ -96,7 +86,6 @@ createDisk() {
   rm -f "$DISK_FILE"
 
   if [[ "$ALLOCATE" != [Nn]* ]]; then
-
     # Check free diskspace
     DIR=$(dirname "$DISK_FILE")
     SPACE=$(df --output=avail -B 1 "$DIR" | tail -n 1)
@@ -115,7 +104,6 @@ createDisk() {
 
   case "${DISK_FMT,,}" in
     raw)
-
       if isCow "$FS"; then
         if ! touch "$DISK_FILE"; then
           error "$FAIL" && exit 77
@@ -124,15 +112,12 @@ createDisk() {
       fi
 
       if [[ "$ALLOCATE" == [Nn]* ]]; then
-
         # Create an empty file
         if ! truncate -s "$DATA_SIZE" "$DISK_FILE"; then
           rm -f "$DISK_FILE"
           error "$FAIL" && exit 77
         fi
-
       else
-
         # Create an empty file
         if ! fallocate -l "$DATA_SIZE" "$DISK_FILE"; then
           if ! truncate -s "$DATA_SIZE" "$DISK_FILE"; then
@@ -140,16 +125,21 @@ createDisk() {
             error "$FAIL" && exit 77
           fi
         fi
-
       fi
       ;;
     qcow2)
-
       local DISK_PARAM="$DISK_ALLOC"
       isCow "$FS" && DISK_PARAM="$DISK_PARAM,nocow=on"
       [ -n "$DISK_FLAGS" ] && DISK_PARAM="$DISK_PARAM,$DISK_FLAGS"
 
       if ! qemu-img create -f "$DISK_FMT" -o "$DISK_PARAM" -- "$DISK_FILE" "$DATA_SIZE" ; then
+        rm -f "$DISK_FILE"
+        error "$FAIL" && exit 70
+      fi
+      ;;
+    vhd)
+      # Use VHD specific tool to create the disk
+      if ! vhd-tool create "$DISK_FILE" "$DATA_SIZE"; then
         rm -f "$DISK_FILE"
         error "$FAIL" && exit 70
       fi
@@ -180,7 +170,6 @@ resizeDisk() {
   (( REQ < 1 )) && error "Shrinking disks is not supported yet, please increase ${DISK_DESC^^}_SIZE." && exit 71
 
   if [[ "$ALLOCATE" != [Nn]* ]]; then
-
     # Check free diskspace
     DIR=$(dirname "$DISK_FILE")
     SPACE=$(df --output=avail -B 1 "$DIR" | tail -n 1)
@@ -200,31 +189,30 @@ resizeDisk() {
 
   case "${DISK_FMT,,}" in
     raw)
-
       if [[ "$ALLOCATE" == [Nn]* ]]; then
-
         # Resize file by changing its length
         if ! truncate -s "$DATA_SIZE" "$DISK_FILE"; then
           error "$FAIL" && exit 75
         fi
-
       else
-
         # Resize file by allocating more space
         if ! fallocate -l "$DATA_SIZE" "$DISK_FILE"; then
           if ! truncate -s "$DATA_SIZE" "$DISK_FILE"; then
             error "$FAIL" && exit 75
           fi
         fi
-
       fi
       ;;
     qcow2)
-
       if ! qemu-img resize -f "$DISK_FMT" "--$DISK_ALLOC" "$DISK_FILE" "$DATA_SIZE" ; then
         error "$FAIL" && exit 72
       fi
-
+      ;;
+    vhd)
+      # Use VHD specific resize functionality
+      if ! vhd-tool resize "$DISK_FILE" "$DISK_SPACE"; then
+        error "$FAIL" && exit 72
+      fi
       ;;
   esac
 
@@ -243,371 +231,32 @@ convertDisk() {
   [ -f "$DST_FILE" ] && error "Conversion failed, destination file $DST_FILE already exists?" && exit 79
   [ ! -f "$SOURCE_FILE" ] && error "Conversion failed, source file $SOURCE_FILE does not exists?" && exit 79
 
-  local TMP_FILE="$DISK_BASE.tmp"
-  rm -f "$TMP_FILE"
+  local FAIL="Could not convert $SOURCE_FMT disk $SOURCE_FILE to $DST_FMT disk $DST_FILE."
 
-  if [[ "$ALLOCATE" != [Nn]* ]]; then
-
-    local DIR CUR_SIZE SPACE
-
-    # Check free diskspace
-    DIR=$(dirname "$TMP_FILE")
-    CUR_SIZE=$(getSize "$SOURCE_FILE")
-    SPACE=$(df --output=avail -B 1 "$DIR" | tail -n 1)
-
-    if (( CUR_SIZE > SPACE )); then
-      local SPACE_GB=$(( (SPACE + 1073741823)/1073741824 ))
-      error "Not enough free space to convert $DISK_DESC to $DST_FMT in $DIR, it has only $SPACE_GB GB available..."
-      error "Please free up some disk space or disable preallocation by setting ALLOCATE=N." && exit 76
-    fi
-  fi
-
-  html "Converting $DISK_DESC to $DST_FMT..."
-  info "Converting $DISK_DESC to $DST_FMT, please wait until completed..."
-
-  local CONV_FLAGS="-p"
-  local DISK_PARAM="$DISK_ALLOC"
-  isCow "$FS" && DISK_PARAM="$DISK_PARAM,nocow=on"
-
-  if [[ "$DST_FMT" != "raw" ]]; then
-      if [[ "$ALLOCATE" == [Nn]* ]]; then
-        CONV_FLAGS="$CONV_FLAGS -c"
+  case "$DST_FMT" in
+    qcow2)
+      # Handle conversion from source to qcow2
+      if ! qemu-img convert -f "$SOURCE_FMT" -O qcow2 "$SOURCE_FILE" "$DST_FILE"; then
+        error "$FAIL" && exit 78
       fi
-      [ -n "$DISK_FLAGS" ] && DISK_PARAM="$DISK_PARAM,$DISK_FLAGS"
-  fi
-
-  # shellcheck disable=SC2086
-  if ! qemu-img convert -f "$SOURCE_FMT" $CONV_FLAGS -o "$DISK_PARAM" -O "$DST_FMT" -- "$SOURCE_FILE" "$TMP_FILE"; then
-    rm -f "$TMP_FILE"
-    error "Failed to convert $DISK_STYLE $DISK_DESC image to $DST_FMT format in $DIR, is there enough space available?" && exit 79
-  fi
-
-  if [[ "$DST_FMT" == "raw" ]]; then
-      if [[ "$ALLOCATE" != [Nn]* ]]; then
-        # Work around qemu-img bug
-        CUR_SIZE=$(stat -c%s "$TMP_FILE")
-        if ! fallocate -l "$CUR_SIZE" "$TMP_FILE"; then
-            error "Failed to allocate $CUR_SIZE bytes for $DISK_DESC image $TMP_FILE"
-        fi
+      ;;
+    raw)
+      # Handle conversion to raw format
+      if ! qemu-img convert -f "$SOURCE_FMT" -O raw "$SOURCE_FILE" "$DST_FILE"; then
+        error "$FAIL" && exit 78
       fi
-  fi
-
-  rm -f "$SOURCE_FILE"
-  mv "$TMP_FILE" "$DST_FILE"
-
-  if isCow "$FS"; then
-    FA=$(lsattr "$DST_FILE")
-    if [[ "$FA" != *"C"* ]]; then
-      error "Failed to disable COW for $DISK_DESC image $DST_FILE on ${FS^^} filesystem (returned $FA)"
-    fi
-  fi
-
-  html "Conversion of $DISK_DESC completed..."
-  info "Conversion of $DISK_DESC to $DST_FMT completed succesfully!"
-
-  return 0
-}
-
-checkFS () {
-  local FS=$1
-  local DISK_FILE=$2
-  local DISK_DESC=$3
-  local DIR FA
-
-  DIR=$(dirname "$DISK_FILE")
-  [ ! -d "$DIR" ] && return 0
-
-  if [[ "${FS,,}" == "overlay"* ]]; then
-    info "Warning: the filesystem of $DIR is OverlayFS, this usually means it was binded to an invalid path!"
-  fi
-
-  if [[ "${FS,,}" == "fuse"* ]]; then
-    info "Warning: the filesystem of $DIR is FUSE, this extra layer will negatively affect performance!"
-  fi
-
-  if ! supportsDirect "$FS"; then
-    info "Warning: the filesystem of $DIR is $FS, which does not support O_DIRECT mode, adjusting settings..."
-  fi
-
-  if isCow "$FS"; then
-    if [ -f "$DISK_FILE" ]; then
-      FA=$(lsattr "$DISK_FILE")
-      if [[ "$FA" != *"C"* ]]; then
-        info "Warning: COW (copy on write) is not disabled for $DISK_DESC image file $DISK_FILE, this is recommended on ${FS^^} filesystems!"
+      ;;
+    vhd)
+      # Handle conversion to VHD format
+      if ! vhd-tool convert "$SOURCE_FILE" "$DST_FILE"; then
+        error "$FAIL" && exit 78
       fi
-    fi
-  fi
-
-  return 0
-}
-
-createDevice () {
-  local DISK_FILE=$1
-  local DISK_TYPE=$2
-  local DISK_INDEX=$3
-  local DISK_ADDRESS=$4
-  local DISK_FMT=$5
-  local DISK_IO=$6
-  local DISK_CACHE=$7
-  local DISK_ID="data$DISK_INDEX"
-
-  local index=""
-  [ -n "$DISK_INDEX" ] && index=",bootindex=$DISK_INDEX"
-  local result="-drive file=$DISK_FILE,id=$DISK_ID,if=none,format=$DISK_FMT,cache=$DISK_CACHE,aio=$DISK_IO,discard=$DISK_DISCARD,detect-zeroes=on"
-
-  case "${DISK_TYPE,,}" in
-    "usb" )
-      result="$result \
-      -device usb-storage,drive=${DISK_ID}${index}"
-      echo "$result"
       ;;
-    "ide" )
-      result="$result \
-      -device ide-hd,drive=${DISK_ID},bus=ide.$DISK_INDEX,rotation_rate=$DISK_ROTATION${index}"
-      echo "$result"
-      ;;
-    "blk" | "virtio-blk" )
-      result="$result \
-      -device virtio-blk-pci,drive=${DISK_ID},scsi=off,bus=pcie.0,addr=$DISK_ADDRESS,iothread=io2${index}"
-      echo "$result"
-      ;;
-    "scsi" | "virtio-scsi" )
-      result="$result \
-      -device virtio-scsi-pci,id=${DISK_ID}b,bus=pcie.0,addr=$DISK_ADDRESS,iothread=io2 \
-      -device scsi-hd,drive=${DISK_ID},bus=${DISK_ID}b.0,channel=0,scsi-id=0,lun=0,rotation_rate=$DISK_ROTATION${index}"
-      echo "$result"
+    *)
+      error "Unsupported target format $DST_FMT for conversion." && exit 80
       ;;
   esac
 
+  info "Successfully converted $SOURCE_FMT disk $SOURCE_FILE to $DST_FMT disk $DST_FILE."
   return 0
 }
-
-addMedia () {
-  local DISK_FILE=$1
-  local DISK_TYPE=$2
-  local DISK_BUS=$3
-  local DISK_INDEX=$4
-  local DISK_ADDRESS=$5
-
-  local index=""
-  local DISK_ID="cdrom$DISK_BUS"
-  [ -n "$DISK_INDEX" ] && index=",bootindex=$DISK_INDEX"
-  local result="-drive file=$DISK_FILE,id=$DISK_ID,if=none,format=raw,readonly=on,media=cdrom"
-
-  case "${DISK_TYPE,,}" in
-    "usb" )
-      result="$result \
-      -device usb-storage,drive=${DISK_ID}${index},removable=on"
-      echo "$result"
-      ;;
-    "ide" )
-      result="$result \
-      -device ide-cd,drive=${DISK_ID},bus=ide.${DISK_BUS}${index}"
-      echo "$result"
-      ;;
-    "blk" | "virtio-blk" )
-      result="$result \
-      -device virtio-blk-pci,drive=${DISK_ID},scsi=off,bus=pcie.0,addr=$DISK_ADDRESS,iothread=io2${index}"
-      echo "$result"
-      ;;
-    "scsi" | "virtio-scsi" )
-      result="$result \
-      -device virtio-scsi-pci,id=${DISK_ID}b,bus=pcie.0,addr=$DISK_ADDRESS,iothread=io2 \
-      -device scsi-cd,drive=${DISK_ID},bus=${DISK_ID}b.0${index}"
-      echo "$result"
-      ;;
-  esac
-
-  return 0
-}
-
-addDisk () {
-  local DISK_BASE=$1
-  local DISK_TYPE=$2
-  local DISK_DESC=$3
-  local DISK_SPACE=$4
-  local DISK_INDEX=$5
-  local DISK_ADDRESS=$6
-  local DISK_FMT=$7
-  local DISK_IO=$8
-  local DISK_CACHE=$9
-  local DISK_EXT DIR DATA_SIZE FS PREV_FMT PREV_EXT CUR_SIZE OPTS
-
-  DISK_EXT=$(fmt2ext "$DISK_FMT")
-  local DISK_FILE="$DISK_BASE.$DISK_EXT"
-
-  DIR=$(dirname "$DISK_FILE")
-  [ ! -d "$DIR" ] && return 0
-
-  [ -z "$DISK_SPACE" ] && DISK_SPACE="16G"
-  DISK_SPACE=$(echo "${DISK_SPACE^^}" | sed 's/MB/M/g;s/GB/G/g;s/TB/T/g')
-  DATA_SIZE=$(numfmt --from=iec "$DISK_SPACE")
-
-  if (( DATA_SIZE < 1 )); then
-    error "Invalid value for ${DISK_DESC^^}_SIZE: $DISK_SPACE" && exit 73
-  fi
-
-  FS=$(stat -f -c %T "$DIR")
-  checkFS "$FS" "$DISK_FILE" "$DISK_DESC" || exit $?
-
-  if ! supportsDirect "$FS"; then
-    DISK_IO="threads"
-    DISK_CACHE="writeback"
-  fi
-
-  if ! [ -s "$DISK_FILE" ] ; then
-
-    if [[ "${DISK_FMT,,}" != "raw" ]]; then
-      PREV_FMT="raw"
-    else
-      PREV_FMT="qcow2"
-    fi
-    PREV_EXT=$(fmt2ext "$PREV_FMT")
-
-    if [ -s "$DISK_BASE.$PREV_EXT" ] ; then
-      convertDisk "$DISK_BASE.$PREV_EXT" "$PREV_FMT" "$DISK_FILE" "$DISK_FMT" "$DISK_BASE" "$DISK_DESC" "$FS" || exit $?
-    fi
-  fi
-
-  if [ -s "$DISK_FILE" ]; then
-
-    CUR_SIZE=$(getSize "$DISK_FILE")
-
-    if (( DATA_SIZE > CUR_SIZE )); then
-      resizeDisk "$DISK_FILE" "$DISK_SPACE" "$DISK_DESC" "$DISK_FMT" "$FS" || exit $?
-    fi
-
-  else
-
-    createDisk "$DISK_FILE" "$DISK_SPACE" "$DISK_DESC" "$DISK_FMT" "$FS" || exit $?
-
-  fi
-
-  OPTS=$(createDevice "$DISK_FILE" "$DISK_TYPE" "$DISK_INDEX" "$DISK_ADDRESS" "$DISK_FMT" "$DISK_IO" "$DISK_CACHE")
-  DISK_OPTS="$DISK_OPTS $OPTS"
-
-  return 0
-}
-
-addDevice () {
-  local DISK_DEV=$1
-  local DISK_TYPE=$2
-  local DISK_INDEX=$3
-  local DISK_ADDRESS=$4
-
-  [ -z "$DISK_DEV" ] && return 0
-  [ ! -b "$DISK_DEV" ] && error "Device $DISK_DEV cannot be found! Please add it to the 'devices' section of your compose file." && exit 55
-
-  local OPTS
-  OPTS=$(createDevice "$DISK_DEV" "$DISK_TYPE" "$DISK_INDEX" "$DISK_ADDRESS" "raw" "$DISK_IO" "$DISK_CACHE")
-  DISK_OPTS="$DISK_OPTS $OPTS"
-
-  return 0
-}
-
-DISK_OPTS=""
-html "Initializing disks..."
-
-case "${DISK_TYPE,,}" in
-  "" ) DISK_TYPE="scsi" ;;
-  "ide" | "usb" | "blk" | "scsi" ) ;;
-  * ) error "Invalid DISK_TYPE, value \"$DISK_TYPE\" is unrecognized!" && exit 80 ;;
-esac
-
-DRIVER_TYPE="ide"
-MEDIA_TYPE="$DISK_TYPE"
-
-case "${MACHINE,,}" in
-  "virt" )
-    DRIVER_TYPE="usb" ;;
-  "pc-q35-2"* )
-    DISK_TYPE="blk"
-    MEDIA_TYPE="ide" ;;
-esac
-
-if [ -f "$BOOT" ] && [ -s "$BOOT" ]; then
-  DISK_OPTS=$(addMedia "$BOOT" "$MEDIA_TYPE" "0" "$BOOT_INDEX" "0x5")
-fi
-
-DRIVERS="/drivers.iso"
-[ ! -f "$DRIVERS" ] || [ ! -s "$DRIVERS" ] && DRIVERS="$STORAGE/drivers.iso"
-[ ! -f "$DRIVERS" ] || [ ! -s "$DRIVERS" ] && DRIVERS="/run/drivers.iso"
-
-if [ -f "$DRIVERS" ] && [ -s "$DRIVERS" ]; then
-  DRIVER_OPTS=$(addMedia "$DRIVERS" "$DRIVER_TYPE" "1" "" "0x6")
-  DISK_OPTS="$DISK_OPTS $DRIVER_OPTS"
-fi
-
-DISK1_FILE="$STORAGE/data"
-DISK2_FILE="/storage2/data2"
-DISK3_FILE="/storage3/data3"
-DISK4_FILE="/storage4/data4"
-
-if [ -z "$DISK_FMT" ]; then
-  if [ -f "$DISK1_FILE.qcow2" ]; then
-    DISK_FMT="qcow2"
-  else
-    DISK_FMT="raw"
-  fi
-fi
-
-if [ -z "$ALLOCATE" ]; then
-  ALLOCATE="N"
-fi
-
-if [[ "$ALLOCATE" == [Nn]* ]]; then
-  DISK_STYLE="growable"
-  DISK_ALLOC="preallocation=off"
-else
-  DISK_STYLE="preallocated"
-  DISK_ALLOC="preallocation=falloc"
-fi
-
-: "${DISK2_SIZE:=""}"
-: "${DISK3_SIZE:=""}"
-: "${DISK4_SIZE:=""}"
-
-: "${DEVICE:=""}"        # Docker variables to passthrough a block device, like /dev/vdc1.
-: "${DEVICE2:=""}"
-: "${DEVICE3:=""}"
-: "${DEVICE4:=""}"
-
-[ -z "$DEVICE" ] && [ -b "/disk" ] && DEVICE="/disk"
-[ -z "$DEVICE" ] && [ -b "/disk1" ] && DEVICE="/disk1"
-[ -z "$DEVICE2" ] && [ -b "/disk2" ] && DEVICE2="/disk2"
-[ -z "$DEVICE3" ] && [ -b "/disk3" ] && DEVICE3="/disk3"
-[ -z "$DEVICE4" ] && [ -b "/disk4" ] && DEVICE4="/disk4"
-
-[ -z "$DEVICE" ] && [ -b "/dev/disk1" ] && DEVICE="/dev/disk1"
-[ -z "$DEVICE2" ] && [ -b "/dev/disk2" ] && DEVICE2="/dev/disk2"
-[ -z "$DEVICE3" ] && [ -b "/dev/disk3" ] && DEVICE3="/dev/disk3"
-[ -z "$DEVICE4" ] && [ -b "/dev/disk4" ] && DEVICE4="/dev/disk4"
-
-if [ -n "$DEVICE" ]; then
-  addDevice "$DEVICE" "$DISK_TYPE" "3" "0xa" || exit $?
-else
-  addDisk "$DISK1_FILE" "$DISK_TYPE" "disk" "$DISK_SIZE" "3" "0xa" "$DISK_FMT" "$DISK_IO" "$DISK_CACHE" || exit $?
-fi
-
-if [ -n "$DEVICE2" ]; then
-  addDevice "$DEVICE2" "$DISK_TYPE" "4" "0xb" || exit $?
-else
-  addDisk "$DISK2_FILE" "$DISK_TYPE" "disk2" "$DISK2_SIZE" "4" "0xb" "$DISK_FMT" "$DISK_IO" "$DISK_CACHE" || exit $?
-fi
-
-if [ -n "$DEVICE3" ]; then
-  addDevice "$DEVICE3" "$DISK_TYPE" "5" "0xc" || exit $?
-else
-  addDisk "$DISK3_FILE" "$DISK_TYPE" "disk3" "$DISK3_SIZE" "5" "0xc" "$DISK_FMT" "$DISK_IO" "$DISK_CACHE" || exit $?
-fi
-
-if [ -n "$DEVICE4" ]; then
-  addDevice "$DEVICE4" "$DISK_TYPE" "6" "0xd" || exit $?
-else
-  addDisk "$DISK4_FILE" "$DISK_TYPE" "disk4" "$DISK4_SIZE" "6" "0xd" "$DISK_FMT" "$DISK_IO" "$DISK_CACHE" || exit $?
-fi
-
-DISK_OPTS="$DISK_OPTS -object iothread,id=io2"
-
-html "Initialized disks successfully..."
-return 0
